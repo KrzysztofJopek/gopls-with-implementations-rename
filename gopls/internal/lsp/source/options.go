@@ -210,6 +210,7 @@ type ClientOptions struct {
 	CompletionTags                             bool
 	CompletionDeprecated                       bool
 	SupportedResourceOperations                []protocol.ResourceOperationKind
+	SupportChangeAnnotations                   bool
 }
 
 // ServerOptions holds LSP-specific configuration that is provided by the
@@ -777,6 +778,8 @@ func (o *Options) ForClientCapabilities(caps protocol.ClientCapabilities) {
 	} else if caps.TextDocument.Completion.CompletionItem.DeprecatedSupport {
 		o.CompletionDeprecated = true
 	}
+
+	o.SupportChangeAnnotations = caps.TextDocument.Rename.HonorsChangeAnnotations
 }
 
 func (o *Options) Clone() *Options {

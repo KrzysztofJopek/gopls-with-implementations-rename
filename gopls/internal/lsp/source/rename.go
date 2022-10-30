@@ -165,34 +165,39 @@ func checkRenamable(obj types.Object) error {
 	return nil
 }
 
+type OptionalEdits struct {
+	Edits       map[span.URI][]protocol.TextEdit
+	Annotations map[protocol.ChangeAnnotationIdentifier]protocol.ChangeAnnotation
+}
+
 // Rename returns a map of TextEdits for each file modified when renaming a
 // given identifier within a package and a boolean value of true for renaming
 // package and false otherwise.
-func Rename(ctx context.Context, s Snapshot, f FileHandle, pp protocol.Position, newName string) (map[span.URI][]protocol.TextEdit, bool, error) {
+func Rename(ctx context.Context, s Snapshot, f FileHandle, pp protocol.Position, newName string) (map[span.URI][]protocol.TextEdit, *OptionalEdits, bool, error) {
 	ctx, done := event.Start(ctx, "source.Rename")
 	defer done()
 
 	pgf, err := s.ParseGo(ctx, f, ParseFull)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
 	inPackageName, err := isInPackageName(ctx, s, f, pgf, pp)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
 
 	if inPackageName {
 		if !isValidIdentifier(newName) {
-			return nil, true, fmt.Errorf("%q is not a valid identifier", newName)
+			return nil, nil, true, fmt.Errorf("%q is not a valid identifier", newName)
 		}
 
 		fileMeta, err := s.MetadataForFile(ctx, f.URI())
 		if err != nil {
-			return nil, true, err
+			return nil, nil, true, err
 		}
 
 		if len(fileMeta) == 0 {
-			return nil, true, fmt.Errorf("no packages found for file %q", f.URI())
+			return nil, nil, true, fmt.Errorf("no packages found for file %q", f.URI())
 		}
 
 		// We need metadata for the relevant package and module paths. These should
@@ -204,38 +209,69 @@ func Rename(ctx context.Context, s Snapshot, f FileHandle, pp protocol.Position,
 		oldPath := meta.PackagePath()
 		var modulePath string
 		if mi := meta.ModuleInfo(); mi == nil {
-			return nil, true, fmt.Errorf("cannot rename package: missing module information for package %q", meta.PackagePath())
+			return nil, nil, true, fmt.Errorf("cannot rename package: missing module information for package %q", meta.PackagePath())
 		} else {
 			modulePath = mi.Path
 		}
 
 		if strings.HasSuffix(newName, "_test") {
-			return nil, true, fmt.Errorf("cannot rename to _test package")
+			return nil, nil, true, fmt.Errorf("cannot rename to _test package")
 		}
 
 		metadata, err := s.AllValidMetadata(ctx)
 		if err != nil {
-			return nil, true, err
+			return nil, nil, true, err
 		}
 
 		renamingEdits, err := renamePackage(ctx, s, modulePath, oldPath, newName, metadata)
 		if err != nil {
-			return nil, true, err
+			return nil, nil, true, err
 		}
 
-		return renamingEdits, true, nil
+		return renamingEdits, nil, true, nil
 	}
 
 	qos, err := qualifiedObjsAtProtocolPos(ctx, s, f.URI(), pp)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
-	result, err := renameObj(ctx, s, newName, qos)
+	result, err := renameObj(ctx, s, newName, qos, false)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
+	}
+	// If renaming interface signature, then use optional annotation for interface implementations edits
+	if isInterfaceSignature(qos[0].obj) {
+		annotatedEdits := make(map[span.URI][]protocol.TextEdit)
+		annotations := make(map[protocol.ChangeAnnotationIdentifier]protocol.ChangeAnnotation)
+		impls, err := implementations(ctx, s, f, pp)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		for implID, impl := range impls {
+			subResult, err := renameObj(ctx, s, newName, []qualifiedObject{impl}, true)
+			if err != nil {
+				return nil, nil, false, err
+			}
+			for uri, res := range subResult {
+				for _, te := range res {
+					te.AnnotationID = fmt.Sprint(implID)
+					annotatedEdits[uri] = append(annotatedEdits[uri], te)
+				}
+			}
+			name := impl.obj.Name()
+			if sig, ok := impl.obj.Type().(*types.Signature); ok {
+				name = fmt.Sprintf("%s.%s", sig.Recv().Type().String(), name)
+			}
+			annotations[fmt.Sprint(implID)] = protocol.ChangeAnnotation{
+				Label:             fmt.Sprintf("Rename implementation #%d", implID+1),
+				NeedsConfirmation: true,
+				Description:       name,
+			}
+		}
+		return result, &OptionalEdits{Annotations: annotations, Edits: annotatedEdits}, false, nil
 	}
 
-	return result, false, nil
+	return result, nil, false, nil
 }
 
 // renamePackage computes all workspace edits required to rename the package
@@ -438,7 +474,7 @@ func renameImports(ctx context.Context, s Snapshot, m Metadata, newPath, newName
 					try++
 					localName = fmt.Sprintf("%s%d", newName, try)
 				}
-				changes, err = renameObj(ctx, s, localName, qos)
+				changes, err = renameObj(ctx, s, localName, qos, false)
 				if err != nil {
 					return err
 				}
@@ -465,7 +501,7 @@ func renameImports(ctx context.Context, s Snapshot, m Metadata, newPath, newName
 
 // renameObj returns a map of TextEdits for renaming an identifier within a file
 // and boolean value of true if there is no renaming conflicts and false otherwise.
-func renameObj(ctx context.Context, s Snapshot, newName string, qos []qualifiedObject) (map[span.URI][]protocol.TextEdit, error) {
+func renameObj(ctx context.Context, s Snapshot, newName string, qos []qualifiedObject, renameImpls bool) (map[span.URI][]protocol.TextEdit, error) {
 	obj := qos[0].obj
 
 	if err := checkRenamable(obj); err != nil {
@@ -477,6 +513,7 @@ func renameObj(ctx context.Context, s Snapshot, newName string, qos []qualifiedO
 	if !isValidIdentifier(newName) {
 		return nil, fmt.Errorf("invalid identifier to rename: %q", newName)
 	}
+
 	refs, err := references(ctx, s, qos, true, false, true)
 	if err != nil {
 		return nil, err
@@ -494,12 +531,16 @@ func renameObj(ctx context.Context, s Snapshot, newName string, qos []qualifiedO
 	// A renaming initiated at an interface method indicates the
 	// intention to rename abstract and concrete methods as needed
 	// to preserve assignability.
-	for _, ref := range refs {
-		if obj, ok := ref.obj.(*types.Func); ok {
-			recv := obj.Type().(*types.Signature).Recv()
-			if recv != nil && IsInterface(recv.Type().Underlying()) {
-				r.changeMethods = true
-				break
+	if renameImpls {
+		r.changeMethods = true
+	} else {
+		for _, ref := range refs {
+			if obj, ok := ref.obj.(*types.Func); ok {
+				recv := obj.Type().(*types.Signature).Recv()
+				if recv != nil && IsInterface(recv.Type().Underlying()) {
+					r.changeMethods = true
+					break
+				}
 			}
 		}
 	}
@@ -543,6 +584,13 @@ func renameObj(ctx context.Context, s Snapshot, newName string, qos []qualifiedO
 		result[uri] = protocolEdits
 	}
 	return result, nil
+}
+
+func isInterfaceSignature(obj types.Object) bool {
+	if obj, ok := obj.(*types.Func); ok {
+		return types.IsInterface(obj.Type().(*types.Signature).Recv().Type().Underlying())
+	}
+	return false
 }
 
 // Rename all references to the identifier.

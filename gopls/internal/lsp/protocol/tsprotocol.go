@@ -4841,6 +4841,9 @@ type TextEdit struct { // line 4428
 	 * empty string.
 	 */
 	NewText string `json:"newText"`
+
+	// TODO
+	AnnotationID ChangeAnnotationIdentifier `json:"annotationId"`
 }
 type TokenFormat string // line 13762
 type TraceValues string // line 13409

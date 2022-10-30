@@ -22,18 +22,29 @@ func (s *Server) rename(ctx context.Context, params *protocol.RenameParams) (*pr
 	// Because we don't handle directory renaming within source.Rename, source.Rename returns
 	// boolean value isPkgRenaming to determine whether an DocumentChanges of type RenameFile should
 	// be added to the return protocol.WorkspaceEdit value.
-	edits, isPkgRenaming, err := source.Rename(ctx, snapshot, fh, params.Position, params.NewName)
+	edits, optionalEdits, isPkgRenaming, err := source.Rename(ctx, snapshot, fh, params.Position, params.NewName)
 	if err != nil {
 		return nil, err
 	}
 
 	var docChanges []protocol.DocumentChanges
+	var annotations map[protocol.ChangeAnnotationIdentifier]protocol.ChangeAnnotation
 	for uri, e := range edits {
 		fh, err := snapshot.GetVersionedFile(ctx, uri)
 		if err != nil {
 			return nil, err
 		}
 		docChanges = append(docChanges, documentChanges(fh, e)...)
+	}
+	if optionalEdits != nil && snapshot.View().Options().ClientOptions.SupportChangeAnnotations {
+		for uri, e := range optionalEdits.Edits {
+			fh, err := snapshot.GetVersionedFile(ctx, uri)
+			if err != nil {
+				return nil, err
+			}
+			docChanges = append(docChanges, documentChanges(fh, e)...)
+		}
+		annotations = optionalEdits.Annotations
 	}
 	if isPkgRenaming {
 		uri := params.TextDocument.URI.SpanURI()
@@ -48,7 +59,8 @@ func (s *Server) rename(ctx context.Context, params *protocol.RenameParams) (*pr
 		})
 	}
 	return &protocol.WorkspaceEdit{
-		DocumentChanges: docChanges,
+		DocumentChanges:   docChanges,
+		ChangeAnnotations: annotations,
 	}, nil
 }
 
